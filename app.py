@@ -8,25 +8,22 @@ from __future__ import annotations
 
 import os
 import re
-import secrets
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from functools import wraps
 from typing import Optional
 
 from flask import (
     Flask,
     abort,
-    flash,
     g,
-    redirect,
-    render_template,
+    jsonify,
     request,
-    session,
-    url_for,
 )
+from flask_cors import CORS
 from werkzeug.security import check_password_hash, generate_password_hash
+import jwt
 
-from database import DB_PATH, close_db, get_db, init_db
+from database import DATABASE_URL, close_db, get_db, init_db
 
 # ------------------------------------------------------------------ #
 # Constants                                                            #
@@ -47,26 +44,19 @@ EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 def create_app() -> Flask:
     app = Flask(__name__)
     app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", DEV_SECRET)
-    app.config["DATABASE"] = DB_PATH
+    app.config["DATABASE"] = DATABASE_URL
+    app.config["JWT_SECRET_KEY"] = os.environ.get("SECRET_KEY", DEV_SECRET)
+    app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=24)
+    
+    # Enable CORS for frontend
+    CORS(app)
 
-    # Create tables on first run. Idempotent.
-    if not os.path.exists(DB_PATH):
-        init_db(DB_PATH)
+    # Initialize database tables
+    init_db()
 
     # Make sure the connection is closed at the end of every request.
     app.teardown_appcontext(close_db)
 
-    # Inject ``current_user`` and a ``csrf_token`` callable into every
-    # template so templates can branch on auth state and emit tokens
-    # without reaching into ``session`` themselves.
-    @app.context_processor
-    def inject_user() -> dict:
-        return {
-            "current_user": _load_current_user(),
-            "csrf_token": _issue_csrf_token,
-        }
-
-    register_filters(app)
     register_routes(app)
     register_error_handlers(app)
     return app
@@ -76,67 +66,40 @@ def create_app() -> Flask:
 # Auth helpers                                                        #
 # ------------------------------------------------------------------ #
 
-def _load_current_user():
-    user_id = session.get("user_id")
-    if user_id is None:
+def _load_current_user_from_token():
+    """Load user from JWT token in Authorization header."""
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
         return None
-    # Cache on ``g`` so multiple calls per request hit the DB once.
-    if "current_user" not in g:
-        g.current_user = get_db().execute(
-            "SELECT id, email, display_name FROM users WHERE id = ?",
-            (user_id,),
-        ).fetchone()
-    return g.current_user
+    
+    token = auth_header.split(" ")[1]
+    try:
+        payload = jwt.decode(
+            token,
+            os.environ.get("SECRET_KEY", DEV_SECRET),
+            algorithms=["HS256"]
+        )
+        user_id = payload.get("user_id")
+        if user_id:
+            from database import get_user_by_id
+            return get_user_by_id(user_id)
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.InvalidTokenError:
+        return None
+    return None
 
 
 def login_required(view):
-    """Reject anonymous users with a redirect to /login?next=..."""
+    """Reject requests without valid JWT token."""
     @wraps(view)
     def wrapped(*args, **kwargs):
-        if session.get("user_id") is None:
-            return redirect(url_for("login", next=request.path))
+        user = _load_current_user_from_token()
+        if user is None:
+            return jsonify({"error": "Unauthorized"}), 401
+        g.current_user = user
         return view(*args, **kwargs)
     return wrapped
-
-
-def _issue_csrf_token() -> str:
-    """Return the per-session CSRF token, generating one if needed."""
-    token = session.get("_csrf")
-    if not token:
-        token = secrets.token_urlsafe(32)
-        session["_csrf"] = token
-    return token
-
-
-def _check_csrf() -> bool:
-    """Compare the submitted token against the session token."""
-    submitted = request.form.get("_csrf", "")
-    expected = session.get("_csrf", "")
-    return bool(submitted) and bool(expected) and secrets.compare_digest(
-        submitted, expected
-    )
-
-
-# ------------------------------------------------------------------ #
-# Template filters                                                     #
-# ------------------------------------------------------------------ #
-
-def register_filters(app: Flask) -> None:
-    @app.template_filter("money")
-    def money(value) -> str:
-        try:
-            return f"₹{float(value):,.2f}"
-        except (TypeError, ValueError):
-            return "₹0.00"
-
-    @app.template_filter("humandate")
-    def humandate(value) -> str:
-        if not value:
-            return ""
-        try:
-            return datetime.strptime(str(value), "%Y-%m-%d").strftime("%d %b %Y")
-        except ValueError:
-            return str(value)
 
 
 # ------------------------------------------------------------------ #
@@ -144,109 +107,71 @@ def register_filters(app: Flask) -> None:
 # ------------------------------------------------------------------ #
 
 def register_routes(app: Flask) -> None:
-    # ----- Public pages -----
-    @app.route("/")
-    def landing():
-        return render_template("landing.html")
+    # ----- Health check -----
+    @app.route("/api/health")
+    def health():
+        return jsonify({"status": "ok"})
 
-    @app.route("/register", methods=["GET", "POST"])
+    # ----- Auth endpoints -----
+    @app.route("/api/register", methods=["POST"])
     def register():
-        if request.method == "POST":
-            if not _check_csrf():
-                abort(400, "Invalid CSRF token.")
-            return _handle_register()
-        return render_template("auth/register.html")
+        return _handle_register()
 
-    @app.route("/login", methods=["GET", "POST"])
+    @app.route("/api/login", methods=["POST"])
     def login():
-        if request.method == "POST":
-            if not _check_csrf():
-                abort(400, "Invalid CSRF token.")
-            return _handle_login()
-        return render_template("auth/login.html")
-
-    @app.route("/logout", methods=["POST"])
-    def logout():
-        if not _check_csrf():
-            abort(400, "Invalid CSRF token.")
-        session.clear()
-        return redirect(url_for("landing"))
+        return _handle_login()
 
     # ----- Dashboard -----
-    @app.route("/dashboard")
+    @app.route("/api/dashboard")
     @login_required
     def dashboard():
         return _handle_dashboard()
 
     # ----- Expenses -----
-    @app.route("/expenses")
+    @app.route("/api/expenses", methods=["GET"])
     @login_required
     def list_expenses():
         return _handle_list_expenses()
 
-    @app.route("/expenses/new", methods=["GET", "POST"])
+    @app.route("/api/expenses", methods=["POST"])
     @login_required
-    def new_expense():
-        if request.method == "POST":
-            if not _check_csrf():
-                abort(400, "Invalid CSRF token.")
-            return _handle_create_expense()
-        return render_template(
-            "expenses/new.html",
-            form=_empty_expense_form(),
-            categories=get_db().execute(
-                "SELECT id, name FROM categories WHERE user_id = ? ORDER BY name",
-                (session["user_id"],),
-            ).fetchall(),
-        )
+    def create_expense():
+        return _handle_create_expense()
 
-    @app.route("/expenses/<int:expense_id>/edit", methods=["GET", "POST"])
+    @app.route("/api/expenses/<int:expense_id>", methods=["GET"])
     @login_required
-    def edit_expense(expense_id: int):
-        if request.method == "POST":
-            if not _check_csrf():
-                abort(400, "Invalid CSRF token.")
-            return _handle_update_expense(expense_id)
-        return _handle_edit_expense_form(expense_id)
+    def get_expense(expense_id: int):
+        return _handle_get_expense(expense_id)
 
-    @app.route("/expenses/<int:expense_id>/delete", methods=["POST"])
+    @app.route("/api/expenses/<int:expense_id>", methods=["PUT"])
+    @login_required
+    def update_expense(expense_id: int):
+        return _handle_update_expense(expense_id)
+
+    @app.route("/api/expenses/<int:expense_id>", methods=["DELETE"])
     @login_required
     def delete_expense(expense_id: int):
-        if not _check_csrf():
-            abort(400, "Invalid CSRF token.")
         return _handle_delete_expense(expense_id)
 
     # ----- Categories -----
-    @app.route("/categories")
+    @app.route("/api/categories", methods=["GET"])
     @login_required
     def list_categories():
         return _handle_list_categories()
 
-    @app.route("/categories/new", methods=["GET", "POST"])
+    @app.route("/api/categories", methods=["POST"])
     @login_required
-    def new_category():
-        if request.method == "POST":
-            if not _check_csrf():
-                abort(400, "Invalid CSRF token.")
-            return _handle_create_category()
-        return render_template(
-            "categories/new.html", form={"name": ""}
-        )
+    def create_category():
+        return _handle_create_category()
 
-    @app.route("/categories/<int:category_id>/edit", methods=["GET", "POST"])
+    @app.route("/api/categories/<int:category_id>", methods=["PUT"])
     @login_required
-    def edit_category(category_id: int):
-        if request.method == "POST":
-            if not _check_csrf():
-                abort(400, "Invalid CSRF token.")
-            return _handle_update_category(category_id)
-        return _handle_edit_category_form(category_id)
+    def update_category(category_id: int):
+        return _handle_update_category(category_id)
 
-    @app.route("/categories/<int:category_id>/delete", methods=["POST"])
+    @app.route("/api/categories/<int:category_id>", methods=["DELETE"])
     @login_required
     def delete_category(category_id: int):
-        if not _check_csrf():
-            abort(400, "Invalid CSRF token.")
         return _handle_delete_category(category_id)
 
 
@@ -255,27 +180,32 @@ def register_routes(app: Flask) -> None:
 # ------------------------------------------------------------------ #
 
 def _handle_register():
-    email = (request.form.get("email") or "").strip().lower()
-    name = (request.form.get("name") or "").strip()
-    password = request.form.get("password") or ""
-    confirm = request.form.get("confirm") or ""
+    data = request.get_json()
+    email = (data.get("email") or "").strip().lower()
+    name = (data.get("name") or "").strip()
+    password = data.get("password") or ""
+    confirm = data.get("confirm") or ""
 
-    form = {"email": email, "name": name}
     error = _validate_registration(email, name, password, confirm)
     if error:
-        return render_template(
-            "auth/register.html", error=error, form=form
-        )
+        return jsonify({"error": error}), 400
 
-    from database import create_user  # local import to avoid cycle in tests
+    from database import create_user
 
     user_id = create_user(email, name, generate_password_hash(password))
-    session.clear()
-    session["user_id"] = user_id
-    session["display_name"] = name
-    session["_csrf"] = _issue_csrf_token()
-    flash("Welcome to Spendly.", "success")
-    return redirect(url_for("dashboard"))
+    
+    # Generate JWT token
+    token = jwt.encode(
+        {"user_id": user_id, "exp": datetime.utcnow() + timedelta(hours=24)},
+        os.environ.get("SECRET_KEY", DEV_SECRET),
+        algorithm="HS256"
+    )
+    
+    return jsonify({
+        "message": "Registration successful",
+        "token": token,
+        "user": {"id": user_id, "email": email, "display_name": name}
+    }), 201
 
 
 def _validate_registration(
@@ -296,24 +226,27 @@ def _validate_registration(
 
 
 def _handle_login():
-    email = (request.form.get("email") or "").strip().lower()
-    password = request.form.get("password") or ""
-    next_url = request.args.get("next") or url_for("dashboard")
+    data = request.get_json()
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
 
     from database import get_user_by_email
     user = get_user_by_email(email)
     if user is None or not check_password_hash(user["password_hash"], password):
-        return render_template(
-            "auth/login.html",
-            error="Invalid email or password.",
-            form={"email": email},
-        )
+        return jsonify({"error": "Invalid email or password"}), 401
 
-    session.clear()
-    session["user_id"] = user["id"]
-    session["display_name"] = user["display_name"]
-    session["_csrf"] = _issue_csrf_token()
-    return redirect(next_url)
+    # Generate JWT token
+    token = jwt.encode(
+        {"user_id": user["id"], "exp": datetime.utcnow() + timedelta(hours=24)},
+        os.environ.get("SECRET_KEY", DEV_SECRET),
+        algorithm="HS256"
+    )
+    
+    return jsonify({
+        "message": "Login successful",
+        "token": token,
+        "user": {"id": user["id"], "email": user["email"], "display_name": user["display_name"]}
+    })
 
 
 # ------------------------------------------------------------------ #
@@ -323,20 +256,19 @@ def _handle_login():
 def _handle_dashboard():
     from database import by_category_for_month, recent_expenses, sum_for_month
 
-    user_id = session["user_id"]
+    user_id = g.current_user["id"]
     year, month = _parse_month(request.args.get("month"))
     prev_year, prev_month = _previous_month(year, month)
 
-    return render_template(
-        "dashboard.html",
-        year=year,
-        month=month,
-        month_label=date(year, month, 1).strftime("%B %Y"),
-        total_this_month=sum_for_month(user_id, year, month),
-        total_last_month=sum_for_month(user_id, prev_year, prev_month),
-        by_category=by_category_for_month(user_id, year, month),
-        recent=recent_expenses(user_id, limit=5),
-    )
+    return jsonify({
+        "year": year,
+        "month": month,
+        "month_label": date(year, month, 1).strftime("%B %Y"),
+        "total_this_month": sum_for_month(user_id, year, month),
+        "total_last_month": sum_for_month(user_id, prev_year, prev_month),
+        "by_category": by_category_for_month(user_id, year, month),
+        "recent": recent_expenses(user_id, limit=5),
+    })
 
 
 def _parse_month(raw: Optional[str]) -> tuple[int, int]:
@@ -360,32 +292,28 @@ def _previous_month(year: int, month: int) -> tuple[int, int]:
 # Handlers — expenses                                                 #
 # ------------------------------------------------------------------ #
 
-def _empty_expense_form() -> dict:
-    return {"amount": "", "category_id": "", "date": date.today().isoformat(), "note": ""}
-
-
-def _parse_expense_form() -> tuple[Optional[dict], Optional[str]]:
-    """Pull and validate the expense fields from ``request.form``."""
+def _parse_expense_data() -> tuple[Optional[dict], Optional[str]]:
+    """Pull and validate the expense fields from JSON request body."""
+    data = request.get_json()
+    
     try:
-        amount_raw = (request.form.get("amount") or "").strip()
-        amount = float(amount_raw)
-    except ValueError:
+        amount = float(data.get("amount", 0))
+    except (TypeError, ValueError):
         return None, "Amount must be a number."
     if amount <= 0:
         return None, "Amount must be greater than zero."
 
-    category_raw = (request.form.get("category_id") or "").strip()
-    if not category_raw.isdigit():
+    category_id = data.get("category_id")
+    if not category_id or not isinstance(category_id, int):
         return None, "Please choose a category."
-    category_id = int(category_raw)
 
-    date_raw = (request.form.get("date") or "").strip()
+    date_raw = data.get("date")
     try:
         datetime.strptime(date_raw, "%Y-%m-%d")
-    except ValueError:
+    except (ValueError, TypeError):
         return None, "Please enter a valid date (YYYY-MM-DD)."
 
-    note = (request.form.get("note") or "").strip()
+    note = data.get("note", "").strip()
     if len(note) > 200:
         return None, "Note must be 200 characters or fewer."
 
@@ -400,103 +328,48 @@ def _parse_expense_form() -> tuple[Optional[dict], Optional[str]]:
     )
 
 
-def _categories_for_user(user_id: int):
-    return get_db().execute(
-        "SELECT id, name FROM categories WHERE user_id = ? ORDER BY name",
-        (user_id,),
-    ).fetchall()
-
-
 def _handle_create_expense():
-    user_id = session["user_id"]
-    parsed, error = _parse_expense_form()
+    user_id = g.current_user["id"]
+    parsed, error = _parse_expense_data()
     if error:
-        return render_template(
-            "expenses/new.html",
-            error=error,
-            form=_form_from_request(),
-            categories=_categories_for_user(user_id),
-        )
+        return jsonify({"error": error}), 400
 
-    # Reject categories not owned by the user.
     from database import get_category
     if get_category(user_id, parsed["category_id"]) is None:
-        return render_template(
-            "expenses/new.html",
-            error="Please choose a category.",
-            form=_form_from_request(),
-            categories=_categories_for_user(user_id),
-        )
+        return jsonify({"error": "Please choose a category."}), 400
 
     from database import create_expense
-    create_expense(
+    expense_id = create_expense(
         user_id=user_id,
         category_id=parsed["category_id"],
         amount=parsed["amount"],
         date=parsed["date"],
         note=parsed["note"],
     )
-    flash("Expense added.", "success")
-    return redirect(url_for("list_expenses"))
+    return jsonify({"message": "Expense created", "id": expense_id}), 201
 
 
-def _form_from_request() -> dict:
-    return {
-        "amount": request.form.get("amount", ""),
-        "category_id": request.form.get("category_id", ""),
-        "date": request.form.get("date", date.today().isoformat()),
-        "note": request.form.get("note", ""),
-    }
-
-
-def _handle_edit_expense_form(expense_id: int):
+def _handle_get_expense(expense_id: int):
     from database import get_expense
-    user_id = session["user_id"]
+    user_id = g.current_user["id"]
     expense = get_expense(user_id, expense_id)
     if expense is None:
-        abort(404)
-    return render_template(
-        "expenses/edit.html",
-        expense=expense,
-        categories=_categories_for_user(user_id),
-    )
+        return jsonify({"error": "Expense not found"}), 404
+    return jsonify(expense)
 
 
 def _handle_update_expense(expense_id: int):
     from database import get_category, get_expense, update_expense
-    user_id = session["user_id"]
+    user_id = g.current_user["id"]
     if get_expense(user_id, expense_id) is None:
-        abort(404)
+        return jsonify({"error": "Expense not found"}), 404
 
-    parsed, error = _parse_expense_form()
+    parsed, error = _parse_expense_data()
     if error:
-        # Re-render the edit form with the user's input preserved.
-        return render_template(
-            "expenses/edit.html",
-            error=error,
-            expense={
-                "id": expense_id,
-                "amount": request.form.get("amount", ""),
-                "category_id": request.form.get("category_id", ""),
-                "date": request.form.get("date", ""),
-                "note": request.form.get("note", ""),
-            },
-            categories=_categories_for_user(user_id),
-        )
+        return jsonify({"error": error}), 400
 
     if get_category(user_id, parsed["category_id"]) is None:
-        return render_template(
-            "expenses/edit.html",
-            error="That category doesn't exist.",
-            expense={
-                "id": expense_id,
-                "amount": request.form.get("amount", ""),
-                "category_id": request.form.get("category_id", ""),
-                "date": request.form.get("date", ""),
-                "note": request.form.get("note", ""),
-            },
-            categories=_categories_for_user(user_id),
-        )
+        return jsonify({"error": "That category doesn't exist."}), 400
 
     update_expense(
         user_id=user_id,
@@ -506,39 +379,36 @@ def _handle_update_expense(expense_id: int):
         date=parsed["date"],
         note=parsed["note"],
     )
-    flash("Expense updated.", "success")
-    return redirect(url_for("list_expenses"))
+    return jsonify({"message": "Expense updated"})
 
 
 def _handle_delete_expense(expense_id: int):
     from database import delete_expense, get_expense
-    user_id = session["user_id"]
+    user_id = g.current_user["id"]
     if get_expense(user_id, expense_id) is None:
-        abort(404)
+        return jsonify({"error": "Expense not found"}), 404
     delete_expense(user_id, expense_id)
-    flash("Expense deleted.", "success")
-    return redirect(url_for("list_expenses"))
+    return jsonify({"message": "Expense deleted"})
 
 
 def _handle_list_expenses():
-    from database import list_expenses, sum_expenses
-    user_id = session["user_id"]
+    from database import list_expenses, sum_expenses, get_categories
+    user_id = g.current_user["id"]
     date_from = _normalize_date(request.args.get("from"))
     date_to = _normalize_date(request.args.get("to"))
     category_raw = (request.args.get("category") or "").strip()
     category_id = int(category_raw) if category_raw.isdigit() else None
 
-    return render_template(
-        "expenses/list.html",
-        expenses=list_expenses(user_id, date_from, date_to, category_id),
-        total=sum_expenses(user_id, date_from, date_to, category_id),
-        categories=_categories_for_user(user_id),
-        filters={
+    return jsonify({
+        "expenses": list_expenses(user_id, date_from, date_to, category_id),
+        "total": sum_expenses(user_id, date_from, date_to, category_id),
+        "categories": get_categories(user_id),
+        "filters": {
             "from": date_from or "",
             "to": date_to or "",
             "category": category_raw,
         },
-    )
+    })
 
 
 def _normalize_date(raw: Optional[str]) -> Optional[str]:
@@ -556,91 +426,58 @@ def _normalize_date(raw: Optional[str]) -> Optional[str]:
 
 def _handle_list_categories():
     from database import category_in_use, get_categories
-    user_id = session["user_id"]
+    user_id = g.current_user["id"]
     categories = get_categories(user_id)
     annotated = [
         {"id": c["id"], "name": c["name"], "in_use": category_in_use(c["id"])}
         for c in categories
     ]
-    return render_template(
-        "categories/list.html", categories=annotated
-    )
+    return jsonify({"categories": annotated})
 
 
 def _handle_create_category():
     from database import create_category
-    name = (request.form.get("name") or "").strip()
+    data = request.get_json()
+    name = (data.get("name") or "").strip()
     error = _validate_category_name(name)
     if error:
-        return render_template(
-            "categories/new.html",
-            error=error,
-            form={"name": name},
-        )
+        return jsonify({"error": error}), 400
     try:
-        create_category(session["user_id"], name)
-    except Exception:  # IntegrityError on duplicate
-        return render_template(
-            "categories/new.html",
-            error="You already have a category with that name.",
-            form={"name": name},
-        )
-    flash(f"Category “{name}” added.", "success")
-    return redirect(url_for("list_categories"))
-
-
-def _handle_edit_category_form(category_id: int):
-    from database import get_category
-    category = get_category(session["user_id"], category_id)
-    if category is None:
-        abort(404)
-    return render_template(
-        "categories/edit.html",
-        category=category,
-    )
+        category_id = create_category(g.current_user["id"], name)
+        return jsonify({"message": "Category created", "id": category_id, "name": name}), 201
+    except Exception:
+        return jsonify({"error": "You already have a category with that name."}), 400
 
 
 def _handle_update_category(category_id: int):
     from database import get_category, update_category
-    user_id = session["user_id"]
+    user_id = g.current_user["id"]
     if get_category(user_id, category_id) is None:
-        abort(404)
-    name = (request.form.get("name") or "").strip()
+        return jsonify({"error": "Category not found"}), 404
+    data = request.get_json()
+    name = (data.get("name") or "").strip()
     error = _validate_category_name(name)
     if error:
-        return render_template(
-            "categories/edit.html",
-            error=error,
-            category={"id": category_id, "name": name},
-        )
+        return jsonify({"error": error}), 400
     try:
         update_category(user_id, category_id, name)
+        return jsonify({"message": "Category updated"})
     except Exception:
-        return render_template(
-            "categories/edit.html",
-            error="You already have a category with that name.",
-            category={"id": category_id, "name": name},
-        )
-    flash("Category updated.", "success")
-    return redirect(url_for("list_categories"))
+        return jsonify({"error": "You already have a category with that name."}), 400
 
 
 def _handle_delete_category(category_id: int):
     from database import category_in_use, delete_category, get_category
-    user_id = session["user_id"]
+    user_id = g.current_user["id"]
     category = get_category(user_id, category_id)
     if category is None:
-        abort(404)
+        return jsonify({"error": "Category not found"}), 404
     if category_in_use(category_id):
-        flash(
-            f"Can't delete “{category['name']}” — it's used by an expense. "
-            f"Reassign those expenses first.",
-            "error",
-        )
-        return redirect(url_for("list_categories"))
+        return jsonify({
+            "error": f"Can't delete “{category['name']}” — it's used by an expense. Reassign those expenses first."
+        }), 400
     delete_category(user_id, category_id)
-    flash("Category deleted.", "success")
-    return redirect(url_for("list_categories"))
+    return jsonify({"message": "Category deleted"})
 
 
 def _validate_category_name(name: str) -> Optional[str]:
@@ -658,15 +495,15 @@ def _validate_category_name(name: str) -> Optional[str]:
 def register_error_handlers(app: Flask) -> None:
     @app.errorhandler(404)
     def not_found(_e):
-        return render_template("error.html", code=404, message="Page not found."), 404
+        return jsonify({"error": "Not found"}), 404
 
     @app.errorhandler(400)
     def bad_request(e):
-        return render_template("error.html", code=400, message=str(e.description)), 400
+        return jsonify({"error": str(e.description)}), 400
 
     @app.errorhandler(500)
     def server_error(_e):
-        return render_template("error.html", code=500, message="Something went wrong."), 500
+        return jsonify({"error": "Internal server error"}), 500
 
 
 # ------------------------------------------------------------------ #
