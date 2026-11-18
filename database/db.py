@@ -7,16 +7,22 @@ through the helpers here so SQL stays in one place.
 from __future__ import annotations
 
 import os
-import sqlite3
+import psycopg2
+from psycopg2 import pool
 from typing import Any, Iterable, Optional
 
-# Database file lives next to this module so the path is stable regardless
-# of the working directory the app is launched from.
-# Can be overridden via SPENDLY_TEST_DB environment variable for testing.
-DB_PATH = os.environ.get(
-    "SPENDLY_TEST_DB",
-    os.path.join(os.path.dirname(__file__), "expense_tracker.db")
+# PostgreSQL connection URL from environment variable
+# Format: postgresql://user:password@host:port/database
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://postgres:postgres@localhost:5432/spendly"
 )
+
+# Connection pool for PostgreSQL
+connection_pool = None
+
+# For testing, can override with test database URL
+TEST_DB_URL = os.environ.get("SPENDLY_TEST_DB")
 
 # Categories seeded for every new user (SPEC §4 "Defaults").
 DEFAULT_CATEGORIES: tuple[str, ...] = (
@@ -32,24 +38,26 @@ DEFAULT_CATEGORIES: tuple[str, ...] = (
 # Connection lifecycle                                                #
 # ------------------------------------------------------------------ #
 
-def get_db() -> sqlite3.Connection:
-    """Return a SQLite connection scoped to the current app context.
+def get_db():
+    """Return a PostgreSQL connection scoped to the current app context.
 
-    The connection is created lazily and stored on ``flask.g`` so the same
-    connection is reused for the duration of a request. ``Row`` factory
-    makes rows indexable by column name, and foreign-key enforcement is
-    turned on (off by default in SQLite).
+    The connection is created lazily from the connection pool and stored on
+    ``flask.g`` so the same connection is reused for the duration of a request.
     """
     from flask import current_app, g
 
-    if "db" not in g:
-        conn = sqlite3.connect(
-            current_app.config["DATABASE"],
-            detect_types=sqlite3.PARSE_DECLTYPES,
+    global connection_pool
+    
+    if connection_pool is None:
+        db_url = TEST_DB_URL if TEST_DB_URL else DATABASE_URL
+        connection_pool = psycopg2.pool.SimpleConnectionPool(
+            minconn=1,
+            maxconn=10,
+            dsn=db_url
         )
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        g.db = conn
+    
+    if "db" not in g:
+        g.db = connection_pool.getconn()
     return g.db
 
 
@@ -57,9 +65,9 @@ def close_db(_exc: Optional[BaseException] = None) -> None:
     """Close the request-scoped connection, if any."""
     from flask import g
 
-    db: Optional[sqlite3.Connection] = g.pop("db", None)
+    db = g.pop("db", None)
     if db is not None:
-        db.close()
+        connection_pool.putconn(db)
 
 
 # ------------------------------------------------------------------ #
@@ -68,30 +76,30 @@ def close_db(_exc: Optional[BaseException] = None) -> None:
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    id            SERIAL PRIMARY KEY,
     email         TEXT    NOT NULL UNIQUE,
     display_name  TEXT    NOT NULL,
     password_hash TEXT    NOT NULL,
-    created_at    TEXT    NOT NULL DEFAULT (datetime('now'))
+    created_at    TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS categories (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    id         SERIAL PRIMARY KEY,
     user_id    INTEGER NOT NULL,
     name       TEXT    NOT NULL,
-    created_at TEXT    NOT NULL DEFAULT (datetime('now')),
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     UNIQUE (user_id, name),
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS expenses (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    id          SERIAL PRIMARY KEY,
     user_id     INTEGER NOT NULL,
     category_id INTEGER NOT NULL,
-    amount      REAL    NOT NULL CHECK (amount > 0),
-    date        TEXT    NOT NULL,
+    amount      NUMERIC NOT NULL CHECK (amount > 0),
+    date        DATE    NOT NULL,
     note        TEXT,
-    created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+    created_at  TIMESTAMP NOT NULL DEFAULT NOW(),
     FOREIGN KEY (user_id)     REFERENCES users(id)     ON DELETE CASCADE,
     FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE RESTRICT
 );
@@ -101,24 +109,16 @@ CREATE INDEX IF NOT EXISTS idx_expenses_user_date
 """
 
 
-def init_db(db_path: Optional[str] = None) -> None:
+def init_db(db_url: Optional[str] = None) -> None:
     """Create all tables and indexes if they don't already exist.
 
-    ``db_path`` defaults to the module-level ``DB_PATH`` so this can be
-    called either from inside an app context (which uses ``DATABASE``) or
-    from the factory before the first request.
+    Uses the DATABASE_URL environment variable or the provided db_url.
     """
-    path = db_path
-    if path is None:
-        try:
-            from flask import current_app
-
-            path = current_app.config["DATABASE"]
-        except RuntimeError:
-            path = DB_PATH
-    conn = sqlite3.connect(path)
+    url = db_url if db_url else (TEST_DB_URL if TEST_DB_URL else DATABASE_URL)
+    conn = psycopg2.connect(url)
     try:
-        conn.executescript(SCHEMA)
+        with conn.cursor() as cur:
+            cur.execute(SCHEMA)
         conn.commit()
     finally:
         conn.close()
@@ -131,91 +131,123 @@ def init_db(db_path: Optional[str] = None) -> None:
 def create_user(email: str, display_name: str, password_hash: str) -> int:
     """Insert a new user and return the assigned id.
 
-    Raises ``sqlite3.IntegrityError`` if the email is already taken.
+    Raises ``psycopg2.IntegrityError`` if the email is already taken.
     """
     db = get_db()
-    cur = db.execute(
-        "INSERT INTO users (email, display_name, password_hash) VALUES (?, ?, ?)",
-        (email, display_name, password_hash),
-    )
+    with db.cursor() as cur:
+        cur.execute(
+            "INSERT INTO users (email, display_name, password_hash) VALUES (%s, %s, %s) RETURNING id",
+            (email, display_name, password_hash),
+        )
+        user_id = cur.fetchone()[0]
     db.commit()
-    user_id = cur.lastrowid
     seed_default_categories(user_id)
     return user_id
 
 
-def get_user_by_id(user_id: int) -> Optional[sqlite3.Row]:
-    return get_db().execute(
-        "SELECT id, email, display_name, password_hash, created_at "
-        "FROM users WHERE id = ?",
-        (user_id,),
-    ).fetchone()
+def get_user_by_id(user_id: int):
+    db = get_db()
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT id, email, display_name, password_hash, created_at "
+            "FROM users WHERE id = %s",
+            (user_id,),
+        )
+        columns = [desc[0] for desc in cur.description]
+        row = cur.fetchone()
+        if row:
+            return dict(zip(columns, row))
+        return None
 
 
-def get_user_by_email(email: str) -> Optional[sqlite3.Row]:
-    return get_db().execute(
-        "SELECT id, email, display_name, password_hash, created_at "
-        "FROM users WHERE email = ?",
-        (email,),
-    ).fetchone()
+def get_user_by_email(email: str):
+    db = get_db()
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT id, email, display_name, password_hash, created_at "
+            "FROM users WHERE email = %s",
+            (email,),
+        )
+        columns = [desc[0] for desc in cur.description]
+        row = cur.fetchone()
+        if row:
+            return dict(zip(columns, row))
+        return None
 
 
 # ------------------------------------------------------------------ #
 # Categories                                                          #
 # ------------------------------------------------------------------ #
 
-def get_categories(user_id: int) -> list[sqlite3.Row]:
-    return get_db().execute(
-        "SELECT id, name FROM categories WHERE user_id = ? ORDER BY name",
-        (user_id,),
-    ).fetchall()
+def get_categories(user_id: int):
+    db = get_db()
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT id, name FROM categories WHERE user_id = %s ORDER BY name",
+            (user_id,),
+        )
+        columns = [desc[0] for desc in cur.description]
+        return [dict(zip(columns, row)) for row in cur.fetchall()]
 
 
-def get_category(user_id: int, category_id: int) -> Optional[sqlite3.Row]:
-    return get_db().execute(
-        "SELECT id, name FROM categories WHERE id = ? AND user_id = ?",
-        (category_id, user_id),
-    ).fetchone()
+def get_category(user_id: int, category_id: int):
+    db = get_db()
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT id, name FROM categories WHERE id = %s AND user_id = %s",
+            (category_id, user_id),
+        )
+        columns = [desc[0] for desc in cur.description]
+        row = cur.fetchone()
+        if row:
+            return dict(zip(columns, row))
+        return None
 
 
 def create_category(user_id: int, name: str) -> int:
     """Insert a new category and return the assigned id.
 
-    Raises ``sqlite3.IntegrityError`` on duplicate (user_id, name).
+    Raises ``psycopg2.IntegrityError`` on duplicate (user_id, name).
     """
     db = get_db()
-    cur = db.execute(
-        "INSERT INTO categories (user_id, name) VALUES (?, ?)",
-        (user_id, name),
-    )
+    with db.cursor() as cur:
+        cur.execute(
+            "INSERT INTO categories (user_id, name) VALUES (%s, %s) RETURNING id",
+            (user_id, name),
+        )
+        category_id = cur.fetchone()[0]
     db.commit()
-    return cur.lastrowid
+    return category_id
 
 
 def update_category(user_id: int, category_id: int, name: str) -> None:
     db = get_db()
-    db.execute(
-        "UPDATE categories SET name = ? WHERE id = ? AND user_id = ?",
-        (name, category_id, user_id),
-    )
+    with db.cursor() as cur:
+        cur.execute(
+            "UPDATE categories SET name = %s WHERE id = %s AND user_id = %s",
+            (name, category_id, user_id),
+        )
     db.commit()
 
 
 def delete_category(user_id: int, category_id: int) -> None:
     db = get_db()
-    db.execute(
-        "DELETE FROM categories WHERE id = ? AND user_id = ?",
-        (category_id, user_id),
-    )
+    with db.cursor() as cur:
+        cur.execute(
+            "DELETE FROM categories WHERE id = %s AND user_id = %s",
+            (category_id, user_id),
+        )
     db.commit()
 
 
 def category_in_use(category_id: int) -> bool:
-    row = get_db().execute(
-        "SELECT 1 FROM expenses WHERE category_id = ? LIMIT 1",
-        (category_id,),
-    ).fetchone()
-    return row is not None
+    db = get_db()
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM expenses WHERE category_id = %s LIMIT 1",
+            (category_id,),
+        )
+        return cur.fetchone() is not None
 
 
 def seed_default_categories(user_id: int) -> None:
@@ -223,7 +255,7 @@ def seed_default_categories(user_id: int) -> None:
     for name in DEFAULT_CATEGORIES:
         try:
             create_category(user_id, name)
-        except sqlite3.IntegrityError:
+        except psycopg2.IntegrityError:
             # Already exists — shouldn't happen for a new user, but stay
             # defensive in case seed is rerun.
             continue
@@ -241,24 +273,33 @@ def create_expense(
     note: Optional[str],
 ) -> int:
     db = get_db()
-    cur = db.execute(
-        "INSERT INTO expenses (user_id, category_id, amount, date, note) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (user_id, category_id, amount, date, note),
-    )
+    with db.cursor() as cur:
+        cur.execute(
+            "INSERT INTO expenses (user_id, category_id, amount, date, note) "
+            "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+            (user_id, category_id, amount, date, note),
+        )
+        expense_id = cur.fetchone()[0]
     db.commit()
-    return cur.lastrowid
+    return expense_id
 
 
-def get_expense(user_id: int, expense_id: int) -> Optional[sqlite3.Row]:
-    return get_db().execute(
-        "SELECT e.id, e.user_id, e.category_id, e.amount, e.date, e.note, "
-        "       c.name AS category_name "
-        "FROM expenses e "
-        "JOIN categories c ON c.id = e.category_id "
-        "WHERE e.id = ? AND e.user_id = ?",
-        (expense_id, user_id),
-    ).fetchone()
+def get_expense(user_id: int, expense_id: int):
+    db = get_db()
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT e.id, e.user_id, e.category_id, e.amount, e.date, e.note, "
+            "       c.name AS category_name "
+            "FROM expenses e "
+            "JOIN categories c ON c.id = e.category_id "
+            "WHERE e.id = %s AND e.user_id = %s",
+            (expense_id, user_id),
+        )
+        columns = [desc[0] for desc in cur.description]
+        row = cur.fetchone()
+        if row:
+            return dict(zip(columns, row))
+        return None
 
 
 def update_expense(
@@ -270,21 +311,23 @@ def update_expense(
     note: Optional[str],
 ) -> None:
     db = get_db()
-    db.execute(
-        "UPDATE expenses "
-        "SET category_id = ?, amount = ?, date = ?, note = ? "
-        "WHERE id = ? AND user_id = ?",
-        (category_id, amount, date, note, expense_id, user_id),
-    )
+    with db.cursor() as cur:
+        cur.execute(
+            "UPDATE expenses "
+            "SET category_id = %s, amount = %s, date = %s, note = %s "
+            "WHERE id = %s AND user_id = %s",
+            (category_id, amount, date, note, expense_id, user_id),
+        )
     db.commit()
 
 
 def delete_expense(user_id: int, expense_id: int) -> None:
     db = get_db()
-    db.execute(
-        "DELETE FROM expenses WHERE id = ? AND user_id = ?",
-        (expense_id, user_id),
-    )
+    with db.cursor() as cur:
+        cur.execute(
+            "DELETE FROM expenses WHERE id = %s AND user_id = %s",
+            (expense_id, user_id),
+        )
     db.commit()
 
 
@@ -293,7 +336,7 @@ def list_expenses(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     category_id: Optional[int] = None,
-) -> list[sqlite3.Row]:
+):
     """Return the user's expenses, newest first, with filters applied.
 
     All filters are AND'd. A None or empty value means "no filter for that
@@ -306,20 +349,25 @@ def list_expenses(
         "       c.id AS category_id, c.name AS category_name "
         "FROM expenses e "
         "JOIN categories c ON c.id = e.category_id "
-        "WHERE e.user_id = ? "
+        "WHERE e.user_id = %s "
     )
     params: list[Any] = [user_id]
     if date_from:
-        sql += "AND e.date >= ? "
+        sql += "AND e.date >= %s "
         params.append(date_from)
     if date_to:
-        sql += "AND e.date <= ? "
+        sql += "AND e.date <= %s "
         params.append(date_to)
     if category_id:
-        sql += "AND e.category_id = ? "
+        sql += "AND e.category_id = %s "
         params.append(category_id)
     sql += "ORDER BY e.date DESC, e.id DESC"
-    return get_db().execute(sql, params).fetchall()
+    
+    db = get_db()
+    with db.cursor() as cur:
+        cur.execute(sql, params)
+        columns = [desc[0] for desc in cur.description]
+        return [dict(zip(columns, row)) for row in cur.fetchall()]
 
 
 def sum_expenses(
@@ -329,19 +377,23 @@ def sum_expenses(
     category_id: Optional[int] = None,
 ) -> float:
     """Sum amounts over the same filter set as ``list_expenses``."""
-    sql = "SELECT COALESCE(SUM(e.amount), 0) AS total FROM expenses e WHERE e.user_id = ? "
+    sql = "SELECT COALESCE(SUM(e.amount), 0) AS total FROM expenses e WHERE e.user_id = %s "
     params: list[Any] = [user_id]
     if date_from:
-        sql += "AND e.date >= ? "
+        sql += "AND e.date >= %s "
         params.append(date_from)
     if date_to:
-        sql += "AND e.date <= ? "
+        sql += "AND e.date <= %s "
         params.append(date_to)
     if category_id:
-        sql += "AND e.category_id = ? "
+        sql += "AND e.category_id = %s "
         params.append(category_id)
-    row = get_db().execute(sql, params).fetchone()
-    return float(row["total"])
+    
+    db = get_db()
+    with db.cursor() as cur:
+        cur.execute(sql, params)
+        row = cur.fetchone()
+        return float(row[0])
 
 
 def _month_bounds(year: int, month: int) -> tuple[str, str]:
@@ -360,46 +412,56 @@ def sum_for_month(user_id: int, year: int, month: int) -> float:
     """Total spending in a single calendar month (1-indexed month)."""
     first, next_first = _month_bounds(year, month)
     db = get_db()
-    row = db.execute(
-        "SELECT COALESCE(SUM(amount), 0) AS total FROM expenses "
-        "WHERE user_id = ? AND date >= ? AND date < ?",
-        (user_id, first, next_first),
-    ).fetchone()
-    return float(row["total"])
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT COALESCE(SUM(amount), 0) AS total FROM expenses "
+            "WHERE user_id = %s AND date >= %s AND date < %s",
+            (user_id, first, next_first),
+        )
+        row = cur.fetchone()
+        return float(row[0])
 
 
 def by_category_for_month(
     user_id: int, year: int, month: int
-) -> list[sqlite3.Row]:
+):
     """Per-category totals for a month, ordered by amount descending.
 
     Categories with zero spending in the month are omitted (``HAVING
     total > 0``).
     """
     first, next_first = _month_bounds(year, month)
-    return get_db().execute(
-        "SELECT c.id AS category_id, c.name AS category_name, "
-        "       COALESCE(SUM(e.amount), 0) AS total "
-        "FROM categories c "
-        "LEFT JOIN expenses e "
-        "  ON e.category_id = c.id "
-        " AND e.date >= ? AND e.date < ? "
-        "WHERE c.user_id = ? "
-        "GROUP BY c.id, c.name "
-        "HAVING total > 0 "
-        "ORDER BY total DESC",
-        (first, next_first, user_id),
-    ).fetchall()
+    db = get_db()
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT c.id AS category_id, c.name AS category_name, "
+            "       COALESCE(SUM(e.amount), 0) AS total "
+            "FROM categories c "
+            "LEFT JOIN expenses e "
+            "  ON e.category_id = c.id "
+            " AND e.date >= %s AND e.date < %s "
+            "WHERE c.user_id = %s "
+            "GROUP BY c.id, c.name "
+            "HAVING total > 0 "
+            "ORDER BY total DESC",
+            (first, next_first, user_id),
+        )
+        columns = [desc[0] for desc in cur.description]
+        return [dict(zip(columns, row)) for row in cur.fetchall()]
 
 
-def recent_expenses(user_id: int, limit: int = 5) -> list[sqlite3.Row]:
-    return get_db().execute(
-        "SELECT e.id, e.amount, e.date, e.note, "
-        "       c.name AS category_name "
-        "FROM expenses e "
-        "JOIN categories c ON c.id = e.category_id "
-        "WHERE e.user_id = ? "
-        "ORDER BY e.date DESC, e.id DESC "
-        "LIMIT ?",
-        (user_id, limit),
-    ).fetchall()
+def recent_expenses(user_id: int, limit: int = 5):
+    db = get_db()
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT e.id, e.amount, e.date, e.note, "
+            "       c.name AS category_name "
+            "FROM expenses e "
+            "JOIN categories c ON c.id = e.category_id "
+            "WHERE e.user_id = %s "
+            "ORDER BY e.date DESC, e.id DESC "
+            "LIMIT %s",
+            (user_id, limit),
+        )
+        columns = [desc[0] for desc in cur.description]
+        return [dict(zip(columns, row)) for row in cur.fetchall()]
